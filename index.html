@@ -1,0 +1,859 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Prepper Disk Search</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2f3a;
+    --text: #e6e8eb;
+    --muted: #9aa3af;
+    --accent: #4f9cf9;
+    --mark-bg: rgba(79, 156, 249, 0.18);
+    --ok: #7fd99a;
+    --ok-border: #2e5c3f;
+    --err: #e06a6a;
+    --err-border: #5c2e2e;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --border: #dde1e7;
+      --text: #1b1f24;
+      --muted: #5d6673;
+      --accent: #1f6fd6;
+      --mark-bg: rgba(31, 111, 214, 0.12);
+      --ok: #1f7a3d;
+      --ok-border: #a8d8b8;
+      --err: #b42318;
+      --err-border: #f0b4ae;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 0;
+    padding: 24px 16px 60px;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 780px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); font-size: 0.9rem; margin-bottom: 20px; }
+  form { display: flex; gap: 8px; }
+  input[type="text"], input[type="url"] {
+    flex: 1;
+    min-width: 0;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 12px 14px;
+    border-radius: 8px;
+    font-size: 1rem;
+  }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 12px 18px;
+    border-radius: 8px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 0.95rem;
+  }
+  button:disabled { opacity: 0.6; cursor: default; }
+  button.secondary {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    font-weight: 400;
+    padding: 6px 12px;
+    font-size: 0.85rem;
+  }
+  .meta-line { color: var(--muted); font-size: 0.85rem; margin: 12px 0 6px; min-height: 1.2em; }
+  .query-used { font-family: var(--mono); color: var(--accent); }
+  .badges { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .badge {
+    font: inherit;
+    font-size: 0.75rem;
+    font-weight: 400;
+    padding: 3px 10px;
+    border-radius: 100px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    cursor: default;
+  }
+  .badge.ok { border-color: var(--ok-border); color: var(--ok); cursor: pointer; }
+  .badge.ok:hover { background: var(--mark-bg); }
+  .badge.err { border-color: var(--err-border); color: var(--err); }
+  .badge.all { cursor: pointer; }
+  .badge.all:hover { background: var(--mark-bg); }
+  .badge[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .badge:disabled { opacity: 0.7; }
+  .filter-line { font-size: 0.85rem; color: var(--muted); margin-bottom: 14px; min-height: 1.2em; }
+  .linklike {
+    background: none; border: none; padding: 0; font: inherit; font-size: inherit;
+    color: var(--accent); cursor: pointer; text-decoration: underline;
+  }
+  .notice {
+    border: 1px solid var(--err-border);
+    color: var(--text);
+    background: var(--panel);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-size: 0.9rem;
+    margin-bottom: 16px;
+  }
+  .notice code, .help code {
+    font-family: var(--mono);
+    background: var(--mark-bg);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  ol.results { list-style: none; padding: 0; margin: 0; }
+  .result {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 10px;
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
+  }
+  .result-body { flex: 1; min-width: 0; }
+  .result-thumb {
+    flex: 0 0 104px;
+    height: 78px;
+    border-radius: 6px;
+    overflow: hidden;
+    background: var(--mark-bg);
+  }
+  .result-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  @media (max-width: 480px) {
+    .result-thumb { flex-basis: 72px; height: 56px; }
+  }
+  .result-title { font-weight: 600; font-size: 1.02rem; }
+  .result-title a { color: var(--text); text-decoration: none; }
+  .result-title a:hover { color: var(--accent); text-decoration: underline; }
+  .result-meta { font-size: 0.8rem; color: var(--muted); margin: 2px 0 6px; }
+  .result-match { font-family: var(--mono); font-size: 0.72rem; color: var(--muted); }
+  .result-snippet { font-size: 0.92rem; margin-top: 6px; overflow-wrap: anywhere; }
+  .result-snippet mark { background: var(--mark-bg); color: inherit; font-weight: 600; padding: 0 1px; border-radius: 2px; }
+  .result-snippet.none { color: var(--muted); font-style: italic; }
+  .empty { color: var(--muted); padding: 16px 0; }
+  details { margin-top: 28px; border-top: 1px solid var(--border); padding-top: 14px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 0.88rem; }
+  .help { font-size: 0.85rem; color: var(--muted); margin: 10px 0; }
+  label { display: block; font-size: 0.85rem; color: var(--muted); margin: 12px 0 4px; }
+  textarea {
+    width: 100%;
+    min-height: 260px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    padding: 10px;
+    border-radius: 8px;
+  }
+  .settings-actions { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
+  label.check { display: flex; gap: 8px; align-items: flex-start; color: var(--text); margin: 14px 0 4px; }
+  label.check input { margin-top: 3px; }
+  label.check span { color: var(--muted); }
+  .settings-status { font-size: 0.82rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Prepper Disk Search</h1>
+  <div class="subtitle">One keyword search per source. Nothing is generated: every result is a verbatim match from your offline library.</div>
+
+  <form id="searchForm" autocomplete="off">
+    <input type="text" id="question" placeholder="how to change a tire" aria-label="Question">
+    <button type="submit" id="searchBtn">Search</button>
+  </form>
+
+  <div class="meta-line" id="queryLine"></div>
+  <div class="badges" id="badges" role="group" aria-label="Filter by source"></div>
+  <div class="filter-line" id="filterLine"></div>
+  <div id="notice"></div>
+  <div id="results"><div class="empty">Type a question and press Enter.</div></div>
+
+  <details id="settings">
+    <summary>Settings: server and sources</summary>
+    <div class="help">
+      Saved in this browser only. Leave the server blank to use the same server this page is loaded from
+      (the normal setup when this file is hosted on the Prepper Disk). When the page is opened as a local
+      file, it uses https://prep.ngrok.pro.
+    </div>
+    <label class="check"><input type="checkbox" id="thumbsInput">
+      <div>Show thumbnails <span>(loads each displayed article in the background to find its first image: up to 8 extra page reads per search, after the results appear)</span></div>
+    </label>
+    <label for="serverInput">Kiwix server</label>
+    <input type="url" id="serverInput" placeholder="(same server as this page)">
+    <label for="endpointsInput">Sources (JSON). Optional <code>intent_phrases</code> boost a source when the question contains one of them.</label>
+    <textarea id="endpointsInput" spellcheck="false"></textarea>
+    <div class="settings-actions">
+      <button type="button" class="secondary" id="saveSettings">Save</button>
+      <button type="button" class="secondary" id="resetSettings">Reset to defaults</button>
+      <span class="settings-status" id="settingsStatus"></span>
+    </div>
+  </details>
+
+  <details>
+    <summary>How ranking works</summary>
+    <div class="help">
+      Your question is reduced to keywords (filler words removed), then searched once per source, all in parallel.
+      Every result from every source is scored the same way, strongest signal first:
+      query words in the title, query words together as a phrase in the title ("Change a Tire" beats
+      "Change a Motorcycle Tire"), a source match for the kind of question (e.g. "how to" favors WikiHow),
+      then query words in the snippet. Ties go to the more on-topic title, then the source's own ranking,
+      then source name. Nothing depends on timing, so the same question always gives the same order.
+    </div>
+  </details>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---------------------------------------------------------------------
+  // Config. Mirrors the tested Python version (prepper_kiwix_search.py).
+  // ---------------------------------------------------------------------
+  const KIWIX_SEARCH_PATH = "/kiwix/search";
+  const FALLBACK_SERVER = "https://prep.ngrok.pro"; // only used when opened as a local file
+  const PAGE_LENGTH = 8;
+  const TOP_K = 8;
+  const HTTP_TIMEOUT_MS = 12000; // per source
+  const STORAGE_KEY = "prepper_disk_search_config_v2";
+
+  // Thumbnails: found by reading the start of each displayed article.
+  const THUMB_CONCURRENCY = 4;          // article reads at once, so the server isn't hit with 8 at a time
+  const THUMB_READ_LIMIT = 128 * 1024;  // stop reading an article after this much; the first image is near the top
+  const MIN_THUMB_PX = 64;              // ignore images declared smaller than this (icons, badges)
+
+  const TITLE_COVERAGE_WEIGHT = 4.0;
+  const TITLE_PHRASE_WEIGHT = 2.0;
+  const INTENT_WEIGHT = 1.0;
+  const SNIPPET_COVERAGE_WEIGHT = 0.5;
+
+  const DEFAULT_ENDPOINTS = [
+    { name: "Wikipedia", book: "wikipedia_en_all_maxi_2025-08" },
+    { name: "WikiHow", book: "wikihow_en_maxi_2023-03",
+      intent_phrases: ["how to", "how do", "how can", "how should", "steps to"] },
+    { name: "Wikibooks", book: "wikibooks_en_all_maxi_2021-03" },
+    { name: "Medical Wiki", book: "mdwiki_en_all_2024-06" },
+    { name: "Military Medicine (FAS)", book: "fas-military-medicine_en_2024-06" },
+    { name: "Ready.gov", book: "www.ready.gov_en_2024-09" },
+    { name: "Outdoors StackExchange", book: "outdoors.stackexchange.com_en_all_2024-11" },
+    { name: "Mechanics StackExchange", book: "mechanics.stackexchange.com_en_all_2025-08" },
+    { name: "Sustainability StackExchange", book: "sustainability.stackexchange.com_en_all_2024-11" }
+  ];
+
+  const STOPWORDS = new Set([
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "how", "what", "where", "when", "why", "who", "which", "can", "could",
+    "do", "does", "did", "i", "you", "my", "me", "to", "of", "in", "on",
+    "at", "for", "with", "about", "find", "some", "any", "there", "it",
+    "that", "this", "and", "or", "if", "so", "will", "would", "should"
+  ]);
+  const PHRASE_STOPWORDS = new Set([...STOPWORDS, "your", "their", "his", "her", "its", "our"]);
+  const SITE_SUFFIX = /\s+[|\-–—]\s+[^|\-–—]{1,25}$/; // " | Ready.gov", " - wikiHow"
+
+  // ---------------------------------------------------------------------
+  // 1. Question -> keyword query (deterministic, no LLM)
+  // ---------------------------------------------------------------------
+  function buildQuery(question) {
+    const words = question.toLowerCase().match(/[a-z0-9']+/g) || [];
+    const kept = words.filter(w => !STOPWORDS.has(w));
+    return (kept.length ? kept : words).join(" ");
+  }
+
+  // ---------------------------------------------------------------------
+  // 2. Text helpers for scoring
+  // ---------------------------------------------------------------------
+  // Conservative stemmer: plurals only. A broader one maps "tiring" -> "tire",
+  // which was a real false positive in testing.
+  function stem(w) {
+    if (w.length > 4 && w.endsWith("ies")) return w.slice(0, -3) + "y";
+    if (w.length > 3 && w.endsWith("s") && !(w.endsWith("ss") || w.endsWith("us") || w.endsWith("is"))) {
+      return w.slice(0, -1);
+    }
+    return w;
+  }
+
+  function contentTerms(text) {
+    return (text.toLowerCase().match(/[a-z0-9]+/g) || [])
+      .filter(t => !PHRASE_STOPWORDS.has(t))
+      .map(stem);
+  }
+
+  function queryTerms(query) {
+    const seen = new Set();
+    const out = [];
+    for (const t of contentTerms(query)) {
+      if (!seen.has(t)) { seen.add(t); out.push(t); }
+    }
+    return out;
+  }
+
+  function cleanTitle(title) {
+    return title.replace(SITE_SUFFIX, "").trim();
+  }
+
+  function coverage(q, tokens) {
+    if (!q.length) return 0;
+    const present = new Set(tokens);
+    return q.filter(t => present.has(t)).length / q.length;
+  }
+
+  // 1 if the query terms appear consecutively, in order (stopwords ignored).
+  function phrase(q, tokens) {
+    const n = q.length;
+    if (!n) return 0;
+    for (let i = 0; i + n <= tokens.length; i++) {
+      let match = true;
+      for (let j = 0; j < n; j++) {
+        if (tokens[i + j] !== q[j]) { match = false; break; }
+      }
+      if (match) return 1;
+    }
+    return 0;
+  }
+
+  function density(q, tokens) {
+    if (!tokens.length) return 0;
+    const qs = new Set(q);
+    return tokens.filter(t => qs.has(t)).length / tokens.length;
+  }
+
+  function escapeRegExp(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function intentMatches(endpoint, question) {
+    const phrases = endpoint.intent_phrases || [];
+    const q = question.toLowerCase();
+    return phrases.some(p => new RegExp("\\b" + escapeRegExp(p.toLowerCase()) + "\\b").test(q)) ? 1 : 0;
+  }
+
+  // ---------------------------------------------------------------------
+  // 3. Kiwix fan-out: one request per source, in parallel, results kept
+  //    in the fixed source order (never completion order).
+  // ---------------------------------------------------------------------
+  function parseKiwixXml(xmlText, base) {
+    const results = [];
+    let doc;
+    try {
+      doc = new DOMParser().parseFromString(xmlText, "application/xml");
+    } catch (e) {
+      return results;
+    }
+    if (doc.getElementsByTagName("parsererror").length) return results;
+
+    let items = Array.from(doc.getElementsByTagName("item"));
+    if (!items.length) items = Array.from(doc.getElementsByTagNameNS("*", "entry"));
+
+    for (const item of items) {
+      const child = name => Array.from(item.children).find(c => c.localName === name);
+      const titleEl = child("title");
+      const linkEl = child("link");
+      const descEl = child("description");
+      const wcEl = child("wordCount");
+
+      const title = titleEl ? titleEl.textContent.trim() : "";
+      let link = linkEl ? linkEl.textContent.trim() : "";
+      if (link && base && link.startsWith("/")) link = base.replace(/\/$/, "") + link;
+      // textContent includes text inside the <b> highlight tags Kiwix adds.
+      const snippet = descEl ? descEl.textContent.replace(/\s+/g, " ").trim() : "";
+      const wordCount = wcEl ? wcEl.textContent.trim() : "";
+
+      if (title || link) results.push({ title: title || "(untitled)", link, snippet, wordCount });
+    }
+    return results;
+  }
+
+  // Some sources return the same page several times (Ready.gov serves one page
+  // in six language paths). Keep the first, best-ranked copy.
+  function dedupeByTitle(items) {
+    const seen = new Set();
+    return items.filter(it => {
+      const key = it.title.trim().toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  async function searchOneEndpoint(endpoint, query, server) {
+    const base = server.replace(/\/$/, "");
+    const params = new URLSearchParams({
+      pattern: query,
+      "books.name": endpoint.book,
+      pageLength: String(PAGE_LENGTH),
+      format: "xml"
+    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+    try {
+      const res = await fetch(base + KIWIX_SEARCH_PATH + "?" + params.toString(), { signal: controller.signal });
+      if (!res.ok) return { name: endpoint.name, items: [], error: "HTTP " + res.status, network: false };
+      const items = dedupeByTitle(parseKiwixXml(await res.text(), base));
+      return { name: endpoint.name, items, error: null, network: false };
+    } catch (e) {
+      // Browsers report blocked cross-origin requests and network failures the same way.
+      const timedOut = e && e.name === "AbortError";
+      return { name: endpoint.name, items: [], error: timedOut ? "timed out" : "request failed", network: !timedOut };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function fanOutSearch(query, endpoints, server) {
+    // Promise.all preserves input order regardless of which request finishes first.
+    return Promise.all(endpoints.map(ep => searchOneEndpoint(ep, query, server)));
+  }
+
+  // ---------------------------------------------------------------------
+  // 4. Shared ranking: every candidate scored the same way. Returns ALL
+  //    candidates in order; the overall view shows the top TOP_K, a
+  //    single-source view shows every result from that source.
+  // ---------------------------------------------------------------------
+  function rankResults(perEndpoint, query, question, endpointsByName) {
+    const q = queryTerms(query);
+    const scored = [];
+    for (const entry of perEndpoint) {
+      const intentHit = intentMatches(endpointsByName[entry.name] || {}, question);
+      entry.items.forEach((item, idx) => {
+        const titleTokens = contentTerms(cleanTitle(item.title));
+        const snippetTokens = contentTerms(item.snippet);
+        const titleCov = coverage(q, titleTokens);
+        const phraseHit = phrase(q, titleTokens);
+        const snippetCov = coverage(q, snippetTokens);
+        const score = TITLE_COVERAGE_WEIGHT * titleCov
+          + TITLE_PHRASE_WEIGHT * phraseHit
+          + INTENT_WEIGHT * intentHit
+          + SNIPPET_COVERAGE_WEIGHT * snippetCov;
+        scored.push({
+          endpoint: entry.name,
+          rank: idx + 1,
+          score,
+          density: density(q, titleTokens),
+          explain: `title ${Math.round(titleCov * 100)}%, phrase ${phraseHit ? "yes" : "no"}, ` +
+                   `intent ${intentHit ? "yes" : "no"}, snippet ${Math.round(snippetCov * 100)}%`,
+          ...item
+        });
+      });
+    }
+    scored.sort((a, b) =>
+      (b.score - a.score) ||
+      (b.density - a.density) ||
+      (a.rank - b.rank) ||
+      (a.endpoint < b.endpoint ? -1 : a.endpoint > b.endpoint ? 1 : 0));
+    return scored;
+  }
+
+  // ---------------------------------------------------------------------
+  // 5. Settings (localStorage is optional; everything works without it)
+  // ---------------------------------------------------------------------
+  function loadConfig() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const cfg = JSON.parse(raw);
+        if (cfg && Array.isArray(cfg.endpoints) && cfg.endpoints.length) {
+          return {
+            server: typeof cfg.server === "string" ? cfg.server : "",
+            endpoints: cfg.endpoints,
+            thumbnails: cfg.thumbnails !== false
+          };
+        }
+      }
+    } catch (e) { /* storage unavailable or corrupt: use defaults */ }
+    return { server: "", endpoints: DEFAULT_ENDPOINTS, thumbnails: true };
+  }
+
+  function saveConfig(cfg) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function clearConfig() {
+    try { localStorage.removeItem(STORAGE_KEY); } catch (e) { /* ignore */ }
+  }
+
+  function effectiveServer(cfg) {
+    if (cfg.server && cfg.server.trim()) return cfg.server.trim();
+    return location.protocol.startsWith("http") ? location.origin : FALLBACK_SERVER;
+  }
+
+  // ---------------------------------------------------------------------
+  // 6. Rendering
+  // ---------------------------------------------------------------------
+  const $ = id => document.getElementById(id);
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  // WikiHow snippets are sometimes raw image metadata (JSON), not article text.
+  function isJunkSnippet(s) {
+    return /"(smallUrl|bigUrl|smallWidth|bigWidth)"\s*:/.test(s);
+  }
+
+  function highlight(snippet, q) {
+    const qs = new Set(q);
+    return snippet.split(/([A-Za-z0-9]+)/).map((part, i) => {
+      if (i % 2 === 1 && qs.has(stem(part.toLowerCase()))) return "<mark>" + escapeHtml(part) + "</mark>";
+      return escapeHtml(part);
+    }).join("");
+  }
+
+  function isUsable(entry) {
+    return !!entry && !entry.error && entry.items.length > 0;
+  }
+
+  // Badges double as filters: click one to show only that source, click it
+  // again (or "All sources") to go back. Sources with no results or an error
+  // can't be selected.
+  function renderBadges(perEndpoint, active) {
+    const all = `<button type="button" class="badge all" data-source="" aria-pressed="${active ? "false" : "true"}">All sources</button>`;
+    $("badges").innerHTML = all + perEndpoint.map(e => {
+      const usable = isUsable(e);
+      const cls = e.error ? "badge err" : (usable ? "badge ok" : "badge");
+      const text = e.error ? `${e.name}: ${e.error}` : `${e.name}: ${e.items.length}`;
+      const attrs = usable
+        ? ` aria-pressed="${active === e.name}" title="${active === e.name ? "Show all sources" : "Show only " + escapeHtml(e.name)}"`
+        : " disabled";
+      return `<button type="button" class="${cls}" data-source="${escapeHtml(e.name)}"${attrs}>${escapeHtml(text)}</button>`;
+    }).join("");
+  }
+
+  function renderFilterLine(active, count) {
+    $("filterLine").innerHTML = active
+      ? `Showing only <strong>${escapeHtml(active)}</strong>: ${count} result${count === 1 ? "" : "s"}, best match first. ` +
+        `<button type="button" class="linklike" data-source="">Show all sources</button>`
+      : "";
+  }
+
+  function renderNotice(perEndpoint) {
+    const allNetworkFailed = perEndpoint.length && perEndpoint.every(e => e.network);
+    if (!allNetworkFailed) { $("notice").innerHTML = ""; return; }
+    $("notice").innerHTML =
+      `<div class="notice"><strong>Every source failed to respond.</strong> If the Kiwix server is up, the browser
+      is blocking the requests because this page was loaded from somewhere other than the Kiwix server, and the
+      server doesn't allow that. Load this page from the Prepper Disk server itself (same address as Kiwix),
+      or check the server address under Settings.</div>`;
+  }
+
+  // ---------------------------------------------------------------------
+  // 6b. Thumbnails. Search results carry no images, so each displayed
+  //     article is read (only its start) to find its first real image.
+  //     Runs after the text results are on screen, a few at a time, and
+  //     each article is read at most once per visit.
+  // ---------------------------------------------------------------------
+  // Picks the first image that looks like content: skips data URIs, SVG
+  // icons, images declared smaller than MIN_THUMB_PX, and icon/logo/avatar
+  // files. Relative paths (Kiwix uses "./images/..." and "./_assets_/...")
+  // are resolved against the article's own address.
+  function pickThumbnail(html, articleUrl) {
+    let doc;
+    try {
+      doc = new DOMParser().parseFromString(html, "text/html");  // parsing doesn't download any images
+    } catch (e) {
+      return null;
+    }
+    for (const img of doc.querySelectorAll("img")) {
+      const src = (img.getAttribute("src") || "").trim();
+      if (!src || src.startsWith("data:")) continue;
+      const w = parseInt(img.getAttribute("width") || img.getAttribute("data-width") || "0", 10);
+      const h = parseInt(img.getAttribute("height") || img.getAttribute("data-height") || "0", 10);
+      if ((w && w < MIN_THUMB_PX) || (h && h < MIN_THUMB_PX)) continue;
+      if (/\.svg(\?|#|$)/i.test(src)) continue;
+      if (/(^|[\W_])(icon|logo|avatar|symbol|sprite|spacer|blank)/i.test(src + " " + (img.getAttribute("class") || ""))) continue;
+      if (/crop-100-100/.test(src)) continue;  // WikiHow author photos
+      try {
+        return new URL(src, articleUrl).href;
+      } catch (e) {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  // Reads at most maxBytes of a response, then stops the download.
+  async function readStart(res, maxBytes) {
+    if (!res.body || typeof res.body.getReader !== "function" || typeof TextDecoder === "undefined") {
+      return (await res.text()).slice(0, maxBytes);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    let bytes = 0;
+    try {
+      while (bytes < maxBytes) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        text += decoder.decode(value, { stream: true });
+      }
+    } finally {
+      reader.cancel().catch(() => {});
+    }
+    return text;
+  }
+
+  async function fetchThumbnail(articleUrl) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+    try {
+      const res = await fetch(articleUrl, { signal: controller.signal });
+      if (!res.ok) return null;
+      return pickThumbnail(await readStart(res, THUMB_READ_LIMIT), articleUrl);
+    } catch (e) {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  const thumbCache = new Map();  // article URL -> Promise<image URL | null>
+  const thumbQueue = [];
+  let thumbActive = 0;
+
+  function pumpThumbQueue() {
+    while (thumbActive < THUMB_CONCURRENCY && thumbQueue.length) {
+      const { url, resolve } = thumbQueue.shift();
+      thumbActive++;
+      fetchThumbnail(url).then(resolve, () => resolve(null)).finally(() => {
+        thumbActive--;
+        pumpThumbQueue();
+      });
+    }
+  }
+
+  function thumbnailFor(link) {
+    const url = new URL(link, location.href).href;
+    if (!thumbCache.has(url)) {
+      thumbCache.set(url, new Promise(resolve => {
+        thumbQueue.push({ url, resolve });
+        pumpThumbQueue();
+      }));
+    }
+    return thumbCache.get(url);
+  }
+
+  // Fills the placeholder next to each displayed result, in display order.
+  // If the view changed meanwhile, the placeholder is gone and nothing happens.
+  function loadThumbnails(list) {
+    if (!config.thumbnails) return;
+    for (const r of list) {
+      if (!r.link) continue;
+      thumbnailFor(r.link).then(src => {
+        const slots = Array.from($("results").querySelectorAll(".result-thumb")).filter(s => s.dataset.for === r.link);
+        for (const slot of slots) {
+          if (slot.firstChild) continue;
+          if (!src) { slot.remove(); continue; }
+          const img = document.createElement("img");
+          img.alt = "";
+          img.loading = "lazy";
+          img.decoding = "async";
+          img.addEventListener("error", () => slot.remove());
+          img.src = src;
+          slot.appendChild(img);
+        }
+      });
+    }
+  }
+
+  function renderResults(merged, q) {
+    if (!merged.length) {
+      $("results").innerHTML = `<div class="empty">No results from any source. Try different words.</div>`;
+      return;
+    }
+    $("results").innerHTML = `<ol class="results">` + merged.map(r => {
+      const wc = r.wordCount ? ` · ${escapeHtml(r.wordCount)} words` : "";
+      const title = r.link
+        ? `<a href="${escapeHtml(r.link)}" target="_blank" rel="noopener">${escapeHtml(r.title)}</a>`
+        : escapeHtml(r.title);
+      const snippet = r.snippet && !isJunkSnippet(r.snippet)
+        ? `<div class="result-snippet">${highlight(r.snippet, q)}</div>`
+        : `<div class="result-snippet none">No text preview for this result.</div>`;
+      const thumb = config.thumbnails && r.link
+        ? `<div class="result-thumb" data-for="${escapeHtml(r.link)}"></div>`
+        : "";
+      return `<li class="result">
+          <div class="result-body">
+            <div class="result-title">${title}</div>
+            <div class="result-meta">${escapeHtml(r.endpoint)} #${r.rank}${wc}</div>
+            <div class="result-match">${escapeHtml(r.explain)}</div>
+            ${snippet}
+          </div>
+          ${thumb}
+        </li>`;
+    }).join("") + `</ol>`;
+    loadThumbnails(merged);
+  }
+
+  // ---------------------------------------------------------------------
+  // 7. Wiring
+  // ---------------------------------------------------------------------
+  let config = loadConfig();
+  let searchSeq = 0;
+  let current = null;       // last completed search: { question, perEndpoint, ranked, q }
+  let activeSource = null;  // source name when filtered, null for all sources
+
+  function fillSettingsForm() {
+    $("serverInput").value = config.server;
+    $("endpointsInput").value = JSON.stringify(config.endpoints, null, 2);
+    $("thumbsInput").checked = config.thumbnails;
+  }
+
+  // Question and filter live in the URL (#q=...&src=...) so results can be
+  // bookmarked and Back works.
+  function makeHash(question, source) {
+    const p = new URLSearchParams({ q: question });
+    if (source) p.set("src", source);
+    return "#" + p.toString();
+  }
+
+  function readHash() {
+    const p = new URLSearchParams(location.hash.slice(1));
+    return { question: (p.get("q") || "").trim(), source: p.get("src") || null };
+  }
+
+  // Filtering reuses the results already fetched: no new search.
+  function renderView() {
+    if (!current) return;
+    renderBadges(current.perEndpoint, activeSource);
+    const list = activeSource
+      ? current.ranked.filter(r => r.endpoint === activeSource)  // every result from that source
+      : current.ranked.slice(0, TOP_K);
+    renderFilterLine(activeSource, list.length);
+    renderResults(list, current.q);
+  }
+
+  function setActiveSource(name) {
+    if (!current) return;
+    activeSource = name && isUsable(current.perEndpoint.find(e => e.name === name)) ? name : null;
+    history.replaceState(null, "", makeHash(current.question, activeSource));
+    renderView();
+  }
+
+  async function runSearch(question, source = null) {
+    question = question.trim();
+    if (!question) return;
+    const seq = ++searchSeq; // ignore results from an older search if a newer one started
+    const endpoints = config.endpoints;
+    const endpointsByName = Object.fromEntries(endpoints.map(e => [e.name, e]));
+    const query = buildQuery(question);
+
+    current = null;
+    activeSource = null;
+    $("searchBtn").disabled = true;
+    $("queryLine").innerHTML = `Searching ${endpoints.length} sources for <span class="query-used">"${escapeHtml(query)}"</span>…`;
+    $("badges").innerHTML = "";
+    $("filterLine").innerHTML = "";
+    $("notice").innerHTML = "";
+    $("results").innerHTML = "";
+
+    try {
+      const perEndpoint = await fanOutSearch(query, endpoints, effectiveServer(config));
+      if (seq !== searchSeq) return;
+      current = {
+        question,
+        perEndpoint,
+        ranked: rankResults(perEndpoint, query, question, endpointsByName),
+        q: queryTerms(query)
+      };
+      activeSource = source && isUsable(perEndpoint.find(e => e.name === source)) ? source : null;
+      $("queryLine").innerHTML = `Query used: <span class="query-used">"${escapeHtml(query)}"</span>`;
+      renderNotice(perEndpoint);
+      renderView();
+    } finally {
+      if (seq === searchSeq) $("searchBtn").disabled = false;
+    }
+  }
+
+  function onFilterClick(e) {
+    const btn = e.target.closest("button[data-source]");
+    if (!btn || btn.disabled) return;
+    const name = btn.dataset.source;
+    setActiveSource(name && name !== activeSource ? name : null); // clicking the active source clears it
+  }
+  $("badges").addEventListener("click", onFilterClick);
+  $("filterLine").addEventListener("click", onFilterClick);
+
+  $("searchForm").addEventListener("submit", e => {
+    e.preventDefault();
+    const question = $("question").value.trim();
+    if (!question) return;
+    const hash = makeHash(question);
+    if (location.hash !== hash) history.pushState(null, "", hash);
+    runSearch(question);
+  });
+
+  function searchFromHash() {
+    const { question, source } = readHash();
+    if (!question) return;
+    $("question").value = question;
+    runSearch(question, source);
+  }
+  window.addEventListener("popstate", searchFromHash);
+
+  $("saveSettings").addEventListener("click", () => {
+    let endpoints;
+    try {
+      endpoints = JSON.parse($("endpointsInput").value);
+      if (!Array.isArray(endpoints) || !endpoints.length) throw new Error("must be a non-empty list");
+      for (const ep of endpoints) {
+        if (!ep.name || !ep.book) throw new Error("every source needs a name and a book");
+      }
+    } catch (e) {
+      $("settingsStatus").textContent = "Not saved: " + e.message;
+      return;
+    }
+    config = { server: $("serverInput").value.trim(), endpoints, thumbnails: config.thumbnails };
+    $("settingsStatus").textContent = saveConfig(config)
+      ? "Saved."
+      : "Applied for this visit (this browser won't let the page store settings).";
+  });
+
+  $("resetSettings").addEventListener("click", () => {
+    clearConfig();
+    config = { server: "", endpoints: DEFAULT_ENDPOINTS, thumbnails: true };
+    fillSettingsForm();
+    renderView();
+    $("settingsStatus").textContent = "Reset to defaults.";
+  });
+
+  // Applies immediately and is saved right away (no need to press Save).
+  $("thumbsInput").addEventListener("change", () => {
+    config = { ...config, thumbnails: $("thumbsInput").checked };
+    saveConfig(config);
+    renderView();
+  });
+
+  fillSettingsForm();
+  searchFromHash();
+  if (!location.hash) $("question").focus();
+
+  // Exposed for automated testing only.
+  window.PrepperSearch = { runSearch, buildQuery, rankResults, parseKiwixXml, pickThumbnail };
+})();
+</script>
+</body>
+</html>
