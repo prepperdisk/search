@@ -169,6 +169,9 @@
   label.check { display: flex; gap: 8px; align-items: flex-start; color: var(--text); margin: 14px 0 4px; }
   label.check input { margin-top: 3px; }
   label.check span { color: var(--muted); }
+  #sourceList label.check { margin: 6px 0; }
+  #sourceList label.check.skipped { opacity: 0.6; }
+  #sourceList code { font-family: var(--mono); font-size: 0.75rem; color: var(--muted); }
   .settings-status { font-size: 0.82rem; color: var(--muted); }
 </style>
 </head>
@@ -199,11 +202,14 @@
       <div>Show thumbnails <span>(loads each displayed article in the background to find its first image: up to 8 extra page reads per search, after the results appear)</span></div>
     </label>
     <label for="serverInput">Kiwix server</label>
-    <input type="url" id="serverInput" placeholder="(same server as this page)">
-    <label for="endpointsInput">Sources (JSON). Optional <code>intent_phrases</code> boost a source when the question contains one of them.</label>
-    <textarea id="endpointsInput" spellcheck="false"></textarea>
-    <div class="settings-actions">
+    <div class="settings-actions" style="margin-top:0">
+      <input type="url" id="serverInput" placeholder="(same server as this page)">
       <button type="button" class="secondary" id="saveSettings">Save</button>
+    </div>
+    <label>Sources</label>
+    <div class="help" id="sourcesStatus" style="margin-top:0"></div>
+    <div id="sourceList"></div>
+    <div class="settings-actions">
       <button type="button" class="secondary" id="resetSettings">Reset to defaults</button>
       <span class="settings-status" id="settingsStatus"></span>
     </div>
@@ -212,12 +218,26 @@
   <details>
     <summary>How ranking works</summary>
     <div class="help">
-      Your question is reduced to keywords (filler words removed), then searched once per source, all in parallel.
-      Every result from every source is scored the same way, strongest signal first:
-      query words in the title, query words together as a phrase in the title ("Change a Tire" beats
-      "Change a Motorcycle Tire"), a source match for the kind of question (e.g. "how to" favors WikiHow),
-      then query words in the snippet. Ties go to the more on-topic title, then the source's own ranking,
-      then source name. Nothing depends on timing, so the same question always gives the same order.
+      Your question is reduced to keywords (filler words removed). Each source gets two lookups in parallel:
+      a full-text search, and a title lookup that also finds redirects (in Wikipedia, "CPR" is a redirect to
+      "Cardiopulmonary resuscitation", which full-text search alone misses). A few abbreviations are also
+      looked up spelled out (CPR, AED and similar).
+    </div>
+    <div class="help">
+      Every result from every source is then scored the same way, strongest signal first: an article whose
+      title is exactly your search, query words in the title, query words together as a phrase in the title,
+      a source match for the kind of question ("how to" favors WikiHow), then query words in the snippet.
+    </div>
+    <div class="help">
+      Two adjustments apply only when the search contains a first-aid or emergency term (CPR, tourniquet,
+      burn, choking, hypothermia and so on): medical and practical sources (medical encyclopedias, MedlinePlus,
+      Ready.gov, WikiHow) get a boost, and pages titled as albums, songs, films, bands and the like move down,
+      unless your search mentions that word. Disambiguation pages always move down. Searches for anything else
+      ("lego", a band name) are ranked on the match alone, so no source is favored.
+    </div>
+    <div class="help">
+      Ties go to the more on-topic title, then the source's own ranking, then source name. Nothing depends on
+      timing, so the same question always gives the same order.
     </div>
   </details>
 </div>
@@ -227,29 +247,95 @@
   "use strict";
 
   // ---------------------------------------------------------------------
-  // Config. Mirrors the tested Python version (prepper_kiwix_search.py).
+  // Config.
   // ---------------------------------------------------------------------
   const KIWIX_SEARCH_PATH = "/kiwix/search";
+  const KIWIX_SUGGEST_PATH = "/kiwix/suggest";  // title index; includes redirects
   const FALLBACK_SERVER = "https://prep.ngrok.pro"; // only used when opened as a local file
   const PAGE_LENGTH = 8;
+  const SUGGEST_COUNT = 8;
   const TOP_K = 8;
   const HTTP_TIMEOUT_MS = 12000; // per source
+  const REDIRECT_TIMEOUT_MS = 5000;
   const STORAGE_KEY = "prepper_disk_search_config_v2";
 
-  // Thumbnails: found by reading the start of each displayed article.
+  // Thumbnails and previews: found by reading the start of each displayed article.
   const THUMB_CONCURRENCY = 4;          // article reads at once, so the server isn't hit with 8 at a time
   const THUMB_READ_LIMIT = 128 * 1024;  // stop reading an article after this much; the first image is near the top
   const MIN_THUMB_PX = 64;              // ignore images declared smaller than this (icons, badges)
+  const PREVIEW_CHARS = 320;
 
+  const EXACT_TITLE_WEIGHT = 5.0;       // title is exactly the search (or a redirect named exactly that)
   const TITLE_COVERAGE_WEIGHT = 4.0;
   const TITLE_PHRASE_WEIGHT = 2.0;
+  const EMERGENCY_SOURCE_WEIGHT = 2.0;  // emergency search + medical/practical source
   const INTENT_WEIGHT = 1.0;
   const SNIPPET_COVERAGE_WEIGHT = 0.5;
+  const MEDIA_PENALTY = 3.0;            // emergency search + "(album)", "(film)"... title
+  const DISAMBIG_PENALTY = 4.0;         // always
 
+  // Searches containing any of these phrases are treated as first aid /
+  // emergency searches. Matched on whole words, after plural stripping.
+  const EMERGENCY_TERMS = [
+    "cpr", "cardiopulmonary resuscitation", "aed", "defibrillator", "first aid", "triage",
+    "tourniquet", "bleeding", "hemorrhage", "haemorrhage", "wound", "laceration", "stitches", "suture",
+    "gunshot", "stab wound", "chest seal", "choking", "heimlich", "abdominal thrust",
+    "burn", "scald", "fracture", "broken bone", "splint", "sprain", "dislocation", "shock",
+    "hypothermia", "frostbite", "heat stroke", "heatstroke", "heat exhaustion", "dehydration",
+    "drowning", "snakebite", "snake bite", "spider bite", "bee sting", "anaphylaxis",
+    "anaphylactic", "allergic reaction", "epipen", "epinephrine", "seizure", "stroke",
+    "heart attack", "myocardial infarction", "chest pain", "unconscious", "recovery position",
+    "concussion", "head injury", "poisoning", "overdose", "naloxone", "narcan", "carbon monoxide",
+    "asthma", "diabetic", "hypoglycemia", "low blood sugar", "insulin", "childbirth", "sepsis",
+    "infection", "fever", "diarrhea", "vomiting", "nosebleed", "epistaxis", "eye injury",
+    "water purification", "purify water", "boil water"
+  ];
+
+  // Equivalent names. A search containing one is also looked up as the others.
+  // (No entry may contain another entry of its own group.)
+  const SYNONYM_GROUPS = [
+    ["cpr", "cardiopulmonary resuscitation"],
+    ["aed", "automated external defibrillator"],
+    ["heimlich", "abdominal thrusts"],
+    ["heart attack", "myocardial infarction"],
+    ["heatstroke", "heat stroke"],
+    ["snakebite", "snake bite"],
+    ["anaphylaxis", "anaphylactic shock"],
+    ["nosebleed", "epistaxis"],
+    ["broken bone", "fracture"],
+    ["hypoglycemia", "low blood sugar"],
+    ["epipen", "epinephrine autoinjector"]
+  ];
+  const MAX_VARIANTS = 4;
+
+  // Sources boosted for emergency searches, matched against the ZIM name and title.
+  // (wikipedia_en_medicine is WikiMed, so "medicine" covers it.)
+  const PRIORITY_SOURCE = /mdwiki|wikimed|medlineplus|medicine|medical|wikem|first.?aid|ready\.gov|cdc\.gov|redcross|fema|wikihow|survival/i;
+
+  const MEDIA_SUFFIX = /\((?:[^()]*\s)?(album|song|single|ep|film|movie|series|band|novel|game|musical|soundtrack|magazine|rapper|singer|group|play)\)\s*$/i;
+  const DISAMBIG_TITLE = /\(disambiguation\)\s*$/i;
+  const DISAMBIG_SNIPPET = /\bmay (?:also )?refer to\b/i;
+
+  // Sources are discovered from the Kiwix catalog every time the page opens,
+  // so ZIMs that are added or upgraded show up with no other step.
+  // count=-1 matters: by default Kiwix lists only the first 10 books.
+  const CATALOG_PATH = "/kiwix/catalog/v2/entries?count=-1";
+  // A source answering HTTP 400 this many searches in a row has no search
+  // index (e.g. video-only ZIMs) and is skipped from then on. Remembered per
+  // ZIM version, so an upgraded ZIM is tried again. (The catalog's own
+  // "_ftindex" tag can't be trusted for this: Outdoors StackExchange is
+  // tagged _ftindex:no but searches fine.)
+  const SKIP_AFTER_400S = 2;
+  const SKIP_STORAGE_KEY = "prepper_disk_search_unsearchable_v1";
+  // Question phrases that boost a source, matched against the ZIM's name.
+  const INTENT_RULES = [
+    { match: /^wikihow/i, phrases: ["how to", "how do", "how can", "how should", "steps to"] }
+  ];
+
+  // Used only if the catalog can't be read.
   const DEFAULT_ENDPOINTS = [
     { name: "Wikipedia", book: "wikipedia_en_all_maxi_2025-08" },
-    { name: "WikiHow", book: "wikihow_en_maxi_2023-03",
-      intent_phrases: ["how to", "how do", "how can", "how should", "steps to"] },
+    { name: "WikiHow", book: "wikihow_en_maxi_2023-03" },
     { name: "Wikibooks", book: "wikibooks_en_all_maxi_2021-03" },
     { name: "Medical Wiki", book: "mdwiki_en_all_2024-06" },
     { name: "Military Medicine (FAS)", book: "fas-military-medicine_en_2024-06" },
@@ -316,18 +402,28 @@
     return q.filter(t => present.has(t)).length / q.length;
   }
 
-  // 1 if the query terms appear consecutively, in order (stopwords ignored).
-  function phrase(q, tokens) {
+  // Position where the terms q appear consecutively, in order, in tokens; -1 if not.
+  function indexOfPhrase(tokens, q) {
     const n = q.length;
-    if (!n) return 0;
+    if (!n) return -1;
     for (let i = 0; i + n <= tokens.length; i++) {
       let match = true;
       for (let j = 0; j < n; j++) {
         if (tokens[i + j] !== q[j]) { match = false; break; }
       }
-      if (match) return 1;
+      if (match) return i;
     }
-    return 0;
+    return -1;
+  }
+
+  // 1 if the query terms appear consecutively, in order (stopwords ignored).
+  function phrase(q, tokens) {
+    return indexOfPhrase(tokens, q) >= 0 ? 1 : 0;
+  }
+
+  // The title is the search and nothing else ("CPR" for "cpr", not "CPR (album)").
+  function exactTitle(q, tokens) {
+    return q.length > 0 && tokens.length === q.length && phrase(q, tokens) === 1;
   }
 
   function density(q, tokens) {
@@ -344,6 +440,37 @@
     const phrases = endpoint.intent_phrases || [];
     const q = question.toLowerCase();
     return phrases.some(p => new RegExp("\\b" + escapeRegExp(p.toLowerCase()) + "\\b").test(q)) ? 1 : 0;
+  }
+
+  // ---------------------------------------------------------------------
+  // 2a. Query variants (synonyms) and emergency detection
+  // ---------------------------------------------------------------------
+  const EMERGENCY_TERM_LISTS = EMERGENCY_TERMS.map(contentTerms).filter(t => t.length);
+  const SYNONYM_LISTS = SYNONYM_GROUPS.map(g => g.map(contentTerms));
+
+  // The query's terms, plus the same terms with any synonym swapped in.
+  // The first variant is always the query as typed.
+  function queryVariants(query) {
+    const base = queryTerms(query);
+    const out = [base];
+    const seen = new Set([base.join(" ")]);
+    for (const group of SYNONYM_LISTS) {
+      for (const from of group) {
+        const at = indexOfPhrase(base, from);
+        if (at < 0) continue;
+        for (const to of group) {
+          if (to === from) continue;
+          const v = [...base.slice(0, at), ...to, ...base.slice(at + from.length)];
+          const key = v.join(" ");
+          if (!seen.has(key) && out.length < MAX_VARIANTS) { seen.add(key); out.push(v); }
+        }
+      }
+    }
+    return out;
+  }
+
+  function isEmergency(variants) {
+    return variants.some(v => EMERGENCY_TERM_LISTS.some(t => phrase(t, v) === 1));
   }
 
   // ---------------------------------------------------------------------
@@ -383,15 +510,107 @@
   }
 
   // Some sources return the same page several times (Ready.gov serves one page
-  // in six language paths). Keep the first, best-ranked copy.
+  // in six language paths). Keep the first, best-ranked copy; if a later copy
+  // was an exact title match, the kept copy inherits that.
   function dedupeByTitle(items) {
-    const seen = new Set();
-    return items.filter(it => {
+    const kept = new Map();
+    const out = [];
+    for (const it of items) {
       const key = it.title.trim().toLowerCase();
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+      if (!key) continue;
+      const first = kept.get(key);
+      if (first) {
+        if (it.exactTitle && !first.exactTitle) { first.exactTitle = true; first.matchedTitle = it.matchedTitle; }
+        continue;
+      }
+      kept.set(key, it);
+      out.push(it);
+    }
+    return out;
+  }
+
+  // Comparable form of an article address.
+  function linkKey(link) {
+    try {
+      const u = new URL(link, location.href);
+      return decodeURIComponent(u.pathname).replace(/_/g, " ").toLowerCase();
+    } catch (e) {
+      return String(link || "").toLowerCase();
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // 3a. Source discovery from the Kiwix catalog (OPDS feed)
+  // ---------------------------------------------------------------------
+  // A ZIM's identity across upgrades: its book name minus the date suffix
+  // (wikibooks_en_all_maxi_2021-03 -> wikibooks_en_all_maxi).
+  function zimKey(book) {
+    return book.replace(/_\d{4}-\d{2}(-\d{2})?$/, "");
+  }
+
+  // contentPath: where the book's articles live on the server
+  // (the catalog's HTML link, e.g. /kiwix/content/wikipedia_en_all_maxi_2025-08).
+  function makeSource(name, book, contentPath) {
+    const key = zimKey(book);
+    const rule = INTENT_RULES.find(r => r.match.test(key));
+    return {
+      name, book, key,
+      contentPath: (contentPath || "/kiwix/content/" + book).replace(/\/$/, ""),
+      intent_phrases: rule ? rule.phrases : [],
+      priority: PRIORITY_SOURCE.test(key) || PRIORITY_SOURCE.test(name)
+    };
+  }
+
+  function parseCatalog(xmlText) {
+    let doc;
+    try {
+      doc = new DOMParser().parseFromString(xmlText, "application/xml");
+    } catch (e) {
+      return [];
+    }
+    if (doc.getElementsByTagName("parsererror").length) return [];
+    const newest = new Map(); // zim key -> entry
+    for (const entry of Array.from(doc.getElementsByTagNameNS("*", "entry"))) {
+      const kids = Array.from(entry.children);
+      const text = n => { const el = kids.find(c => c.localName === n); return el ? el.textContent.trim() : ""; };
+      const link = kids.find(c => c.localName === "link" && (c.getAttribute("type") || "").startsWith("text/html"));
+      const href = link ? link.getAttribute("href") || "" : "";
+      const book = decodeURIComponent(href.split("/").filter(Boolean).pop() || "");
+      if (!book) continue;
+      const item = { title: text("title") || book, book, updated: text("updated"), href: href.startsWith("/") ? href : "" };
+      const key = zimKey(book);
+      const prev = newest.get(key);
+      // Two versions of the same ZIM loaded: keep the newer one.
+      if (!prev || item.book > prev.book || (item.book === prev.book && item.updated > prev.updated)) {
+        newest.set(key, item);
+      }
+    }
+    const items = Array.from(newest.values());
+    // Two different ZIMs with the same title get their ZIM name added, so
+    // every source has a unique label (filters and ranking rely on it).
+    const titleCount = {};
+    items.forEach(i => { titleCount[i.title] = (titleCount[i.title] || 0) + 1; });
+    return items
+      .map(i => makeSource(titleCount[i.title] > 1 ? `${i.title} (${zimKey(i.book)})` : i.title, i.book, i.href))
+      .sort((a, b) => (a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : 0));
+  }
+
+  async function discoverSources(server) {
+    const base = server.replace(/\/$/, "");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+    try {
+      const res = await fetch(base + CATALOG_PATH, { signal: controller.signal });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const sources = parseCatalog(await res.text());
+      if (!sources.length) throw new Error("the catalog lists no books");
+      return { sources, discovered: true, error: null };
+    } catch (e) {
+      const reason = e && e.name === "AbortError" ? "timed out" : (e && e.message) || "request failed";
+      return { sources: DEFAULT_ENDPOINTS.map(ep => makeSource(ep.name, ep.book)), discovered: false, error: reason };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async function searchOneEndpoint(endpoint, query, server) {
@@ -406,13 +625,13 @@
     const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
     try {
       const res = await fetch(base + KIWIX_SEARCH_PATH + "?" + params.toString(), { signal: controller.signal });
-      if (!res.ok) return { name: endpoint.name, items: [], error: "HTTP " + res.status, network: false };
+      if (!res.ok) return { name: endpoint.name, book: endpoint.book, items: [], error: "HTTP " + res.status, status: res.status, network: false };
       const items = dedupeByTitle(parseKiwixXml(await res.text(), base));
-      return { name: endpoint.name, items, error: null, network: false };
+      return { name: endpoint.name, book: endpoint.book, items, error: null, status: res.status, network: false };
     } catch (e) {
       // Browsers report blocked cross-origin requests and network failures the same way.
       const timedOut = e && e.name === "AbortError";
-      return { name: endpoint.name, items: [], error: timedOut ? "timed out" : "request failed", network: !timedOut };
+      return { name: endpoint.name, book: endpoint.book, items: [], error: timedOut ? "timed out" : "request failed", status: 0, network: !timedOut };
     } finally {
       clearTimeout(timer);
     }
@@ -424,33 +643,154 @@
   }
 
   // ---------------------------------------------------------------------
+  // 3b. Title lookup (Kiwix suggestions). Unlike full-text search, the
+  //     title index includes redirects, so "CPR" finds Wikipedia's
+  //     "Cardiopulmonary resuscitation" article. Failures are silent: the
+  //     full-text results still stand on their own.
+  // ---------------------------------------------------------------------
+  function articleUrl(base, endpoint, path) {
+    const clean = String(path).replace(/^\/+/, "")
+      .split("/")
+      .map(seg => (/%[0-9A-Fa-f]{2}/.test(seg) ? seg : encodeURIComponent(seg)))
+      .join("/");
+    return base + endpoint.contentPath + "/" + clean;
+  }
+
+  async function suggestOne(endpoint, term, server) {
+    const base = server.replace(/\/$/, "");
+    const params = new URLSearchParams({ content: endpoint.book, term, count: String(SUGGEST_COUNT) });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+    try {
+      const res = await fetch(base + KIWIX_SUGGEST_PATH + "?" + params.toString(), { signal: controller.signal });
+      if (!res.ok) return [];
+      const data = JSON.parse(await res.text());
+      if (!Array.isArray(data)) return [];
+      return data
+        .filter(d => d && d.kind !== "pattern" && d.path && d.value)
+        .map(d => ({ title: String(d.value).trim(), link: articleUrl(base, endpoint, d.path), snippet: "", wordCount: "" }));
+    } catch (e) {
+      return [];
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // One list of title hits per source (same order as endpoints), across all variants.
+  function fanOutSuggest(terms, endpoints, server) {
+    return Promise.all(endpoints.map(async ep => {
+      const lists = await Promise.all(terms.map(t => suggestOne(ep, t, server)));
+      return [].concat(...lists);
+    }));
+  }
+
+  // If an article address is a redirect, follows it and names the result
+  // after the target article. Only the headers are needed.
+  async function resolveRedirect(item) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REDIRECT_TIMEOUT_MS);
+    try {
+      const res = await fetch(item.link, { signal: controller.signal });
+      if (res.body && typeof res.body.cancel === "function") res.body.cancel().catch(() => {});
+      if (res.ok && res.redirected && res.url && linkKey(res.url) !== linkKey(item.link)) {
+        const seg = decodeURIComponent(new URL(res.url).pathname.split("/").filter(Boolean).pop() || "");
+        const target = seg.replace(/_/g, " ").replace(/\.html?$/i, "").trim();
+        item.link = res.url;
+        if (target) { item.redirectedFrom = item.title; item.title = target; }
+      }
+    } catch (e) {
+      /* keep the address as is */
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Adds title hits that contain every query word to each source's results.
+  // A title hit that is already among the full-text results just marks that
+  // result as an exact title match, so it keeps its snippet.
+  async function mergeTitleHits(perEndpoint, suggestions, variants) {
+    const jobs = [];
+    perEndpoint.forEach((entry, i) => {
+      if (entry.error) return;
+      for (const s of suggestions[i] || []) {
+        const tokens = contentTerms(cleanTitle(s.title));
+        if (!variants.some(v => coverage(v, tokens) === 1)) continue;
+        const exact = variants.some(v => exactTitle(v, tokens));
+        const dup = entry.items.find(o => !o.drop && (linkKey(o.link) === linkKey(s.link) || o.title.trim().toLowerCase() === s.title.toLowerCase()));
+        if (dup) {
+          if (exact && !dup.exactTitle) { dup.exactTitle = true; dup.matchedTitle = s.title; }
+          continue;
+        }
+        const item = { ...s, via: "title", rank: entry.items.length + 1, exactTitle: exact, matchedTitle: s.title };
+        entry.items.push(item);
+        if (!exact) continue;
+        jobs.push(resolveRedirect(item).then(() => {
+          const twin = entry.items.find(o => o !== item && !o.drop && linkKey(o.link) === linkKey(item.link));
+          if (twin) {
+            if (!twin.exactTitle) { twin.exactTitle = true; twin.matchedTitle = item.matchedTitle; }
+            item.drop = true;
+          }
+        }));
+      }
+    });
+    await Promise.all(jobs);
+    perEndpoint.forEach(entry => {
+      entry.items = dedupeByTitle(entry.items.filter(it => !it.drop));
+    });
+  }
+
+  // ---------------------------------------------------------------------
   // 4. Shared ranking: every candidate scored the same way. Returns ALL
   //    candidates in order; the overall view shows the top TOP_K, a
   //    single-source view shows every result from that source.
   // ---------------------------------------------------------------------
-  function rankResults(perEndpoint, query, question, endpointsByName) {
-    const q = queryTerms(query);
+  function rankResults(perEndpoint, variants, question, endpointsByName, emergency) {
+    const ql = question.toLowerCase();
     const scored = [];
     for (const entry of perEndpoint) {
-      const intentHit = intentMatches(endpointsByName[entry.name] || {}, question);
+      const ep = endpointsByName[entry.name] || {};
+      const intentHit = intentMatches(ep, question);
+      const prioHit = emergency && ep.priority ? 1 : 0;
       entry.items.forEach((item, idx) => {
-        const titleTokens = contentTerms(cleanTitle(item.title));
+        const shownTitle = cleanTitle(item.title);
+        const titleTokens = contentTerms(shownTitle);
         const snippetTokens = contentTerms(item.snippet);
-        const titleCov = coverage(q, titleTokens);
-        const phraseHit = phrase(q, titleTokens);
-        const snippetCov = coverage(q, snippetTokens);
-        const score = TITLE_COVERAGE_WEIGHT * titleCov
-          + TITLE_PHRASE_WEIGHT * phraseHit
+
+        // Score against whichever variant ("cpr" or "cardiopulmonary resuscitation") fits best.
+        let best = null;
+        for (const v of variants) {
+          const titleCov = coverage(v, titleTokens);
+          const phraseHit = phrase(v, titleTokens);
+          const snippetCov = coverage(v, snippetTokens);
+          const s = TITLE_COVERAGE_WEIGHT * titleCov + TITLE_PHRASE_WEIGHT * phraseHit + SNIPPET_COVERAGE_WEIGHT * snippetCov;
+          if (!best || s > best.s) best = { s, v, titleCov, phraseHit, snippetCov };
+        }
+        const exact = item.exactTitle || variants.some(v => exactTitle(v, titleTokens)) ? 1 : 0;
+        const disambig = DISAMBIG_TITLE.test(shownTitle) || DISAMBIG_SNIPPET.test(item.snippet) ? 1 : 0;
+        const mediaMatch = emergency ? shownTitle.match(MEDIA_SUFFIX) : null;
+        const media = mediaMatch && !new RegExp("\\b" + escapeRegExp(mediaMatch[1].toLowerCase()) + "\\b").test(ql) ? 1 : 0;
+
+        const score = best.s
+          + EXACT_TITLE_WEIGHT * exact
           + INTENT_WEIGHT * intentHit
-          + SNIPPET_COVERAGE_WEIGHT * snippetCov;
+          + EMERGENCY_SOURCE_WEIGHT * prioHit
+          - DISAMBIG_PENALTY * disambig
+          - MEDIA_PENALTY * media;
+
+        const notes = [];
+        if (exact) notes.push("exact title");
+        if (prioHit) notes.push("emergency source");
+        if (disambig) notes.push("disambiguation, moved down");
+        if (media) notes.push(mediaMatch[1].toLowerCase() + " page, moved down");
         scored.push({
+          ...item,
           endpoint: entry.name,
-          rank: idx + 1,
+          rank: item.rank || idx + 1,
           score,
-          density: density(q, titleTokens),
-          explain: `title ${Math.round(titleCov * 100)}%, phrase ${phraseHit ? "yes" : "no"}, ` +
-                   `intent ${intentHit ? "yes" : "no"}, snippet ${Math.round(snippetCov * 100)}%`,
-          ...item
+          density: density(best.v, titleTokens),
+          explain: `title ${Math.round(best.titleCov * 100)}%, phrase ${best.phraseHit ? "yes" : "no"}, ` +
+                   `intent ${intentHit ? "yes" : "no"}, snippet ${Math.round(best.snippetCov * 100)}%` +
+                   (notes.length ? " · " + notes.join(", ") : "")
         });
       });
     }
@@ -465,21 +805,38 @@
   // ---------------------------------------------------------------------
   // 5. Settings (localStorage is optional; everything works without it)
   // ---------------------------------------------------------------------
+  // Stored per browser: server override, thumbnails on/off, and the sources
+  // this user unticked (by ZIM key, so the choice survives ZIM upgrades).
+  function defaultConfig() {
+    return { server: "", thumbnails: true, disabled: [] };
+  }
+
   function loadConfig() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        const cfg = JSON.parse(raw);
-        if (cfg && Array.isArray(cfg.endpoints) && cfg.endpoints.length) {
-          return {
-            server: typeof cfg.server === "string" ? cfg.server : "",
-            endpoints: cfg.endpoints,
-            thumbnails: cfg.thumbnails !== false
-          };
-        }
+        const cfg = JSON.parse(raw) || {};
+        return {
+          server: typeof cfg.server === "string" ? cfg.server : "",
+          thumbnails: cfg.thumbnails !== false,
+          disabled: Array.isArray(cfg.disabled) ? cfg.disabled : []
+        };
       }
     } catch (e) { /* storage unavailable or corrupt: use defaults */ }
-    return { server: "", endpoints: DEFAULT_ENDPOINTS, thumbnails: true };
+    return defaultConfig();
+  }
+
+  // Count of consecutive HTTP 400 answers per book (dated name).
+  function loadStrikes() {
+    try { return JSON.parse(localStorage.getItem(SKIP_STORAGE_KEY) || "{}") || {}; } catch (e) { return {}; }
+  }
+
+  function saveStrikes(strikes) {
+    try { localStorage.setItem(SKIP_STORAGE_KEY, JSON.stringify(strikes)); } catch (e) { /* in-memory only */ }
+  }
+
+  function clearStrikes() {
+    try { localStorage.removeItem(SKIP_STORAGE_KEY); } catch (e) { /* ignore */ }
   }
 
   function saveConfig(cfg) {
@@ -560,22 +917,25 @@
   }
 
   // ---------------------------------------------------------------------
-  // 6b. Thumbnails. Search results carry no images, so each displayed
-  //     article is read (only its start) to find its first real image.
-  //     Runs after the text results are on screen, a few at a time, and
-  //     each article is read at most once per visit.
+  // 6b. Thumbnails and previews. Search results carry no images, and title
+  //     hits carry no snippet, so displayed articles are read (only their
+  //     start) to find the first real image and the first paragraph. Runs
+  //     after the text results are on screen, a few at a time, and each
+  //     article is read at most once per visit.
   // ---------------------------------------------------------------------
+  function parseHtml(html) {
+    try {
+      return new DOMParser().parseFromString(html, "text/html");  // parsing doesn't download any images
+    } catch (e) {
+      return null;
+    }
+  }
+
   // Picks the first image that looks like content: skips data URIs, SVG
   // icons, images declared smaller than MIN_THUMB_PX, and icon/logo/avatar
   // files. Relative paths (Kiwix uses "./images/..." and "./_assets_/...")
   // are resolved against the article's own address.
-  function pickThumbnail(html, articleUrl) {
-    let doc;
-    try {
-      doc = new DOMParser().parseFromString(html, "text/html");  // parsing doesn't download any images
-    } catch (e) {
-      return null;
-    }
+  function thumbFromDoc(doc, articleUrl) {
     for (const img of doc.querySelectorAll("img")) {
       const src = (img.getAttribute("src") || "").trim();
       if (!src || src.startsWith("data:")) continue;
@@ -592,6 +952,31 @@
       }
     }
     return null;
+  }
+
+  // First real paragraph of the article, without reference marks or infobox text.
+  function previewFromDoc(doc) {
+    doc.querySelectorAll("table, sup, style, script, figure, .infobox, .hatnote, .navbox, .mw-empty-elt").forEach(el => el.remove());
+    for (const p of doc.querySelectorAll("p")) {
+      const text = p.textContent.replace(/\[\d+\]/g, "").replace(/\s+/g, " ").trim();
+      if (text.length < 80) continue;
+      if (text.length <= PREVIEW_CHARS) return text;
+      const cut = text.slice(0, PREVIEW_CHARS);
+      return cut.slice(0, Math.max(cut.lastIndexOf(" "), PREVIEW_CHARS - 40)) + "…";
+    }
+    return null;
+  }
+
+  function pickThumbnail(html, articleUrl) {
+    const doc = parseHtml(html);
+    return doc ? thumbFromDoc(doc, articleUrl) : null;
+  }
+
+  function articleInfo(html, articleUrl) {
+    const doc = parseHtml(html);
+    if (!doc) return { thumb: null, preview: null };
+    const thumb = thumbFromDoc(doc, articleUrl);  // before previewFromDoc removes figures
+    return { thumb, preview: previewFromDoc(doc) };
   }
 
   // Reads at most maxBytes of a response, then stops the download.
@@ -616,109 +1001,171 @@
     return text;
   }
 
-  async function fetchThumbnail(articleUrl) {
+  async function fetchArticleInfo(articleUrl) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
     try {
       const res = await fetch(articleUrl, { signal: controller.signal });
-      if (!res.ok) return null;
-      return pickThumbnail(await readStart(res, THUMB_READ_LIMIT), articleUrl);
+      if (!res.ok) return { thumb: null, preview: null };
+      return articleInfo(await readStart(res, THUMB_READ_LIMIT), res.url || articleUrl);
     } catch (e) {
-      return null;
+      return { thumb: null, preview: null };
     } finally {
       clearTimeout(timer);
     }
   }
 
-  const thumbCache = new Map();  // article URL -> Promise<image URL | null>
-  const thumbQueue = [];
-  let thumbActive = 0;
+  const infoCache = new Map();  // article URL -> Promise<{thumb, preview}>
+  const infoQueue = [];
+  let infoActive = 0;
 
-  function pumpThumbQueue() {
-    while (thumbActive < THUMB_CONCURRENCY && thumbQueue.length) {
-      const { url, resolve } = thumbQueue.shift();
-      thumbActive++;
-      fetchThumbnail(url).then(resolve, () => resolve(null)).finally(() => {
-        thumbActive--;
-        pumpThumbQueue();
+  function pumpInfoQueue() {
+    while (infoActive < THUMB_CONCURRENCY && infoQueue.length) {
+      const { url, resolve } = infoQueue.shift();
+      infoActive++;
+      fetchArticleInfo(url).then(resolve, () => resolve({ thumb: null, preview: null })).finally(() => {
+        infoActive--;
+        pumpInfoQueue();
       });
     }
   }
 
-  function thumbnailFor(link) {
+  function infoFor(link) {
     const url = new URL(link, location.href).href;
-    if (!thumbCache.has(url)) {
-      thumbCache.set(url, new Promise(resolve => {
-        thumbQueue.push({ url, resolve });
-        pumpThumbQueue();
+    if (!infoCache.has(url)) {
+      infoCache.set(url, new Promise(resolve => {
+        infoQueue.push({ url, resolve });
+        pumpInfoQueue();
       }));
     }
-    return thumbCache.get(url);
+    return infoCache.get(url);
   }
 
-  // Fills the placeholder next to each displayed result, in display order.
-  // If the view changed meanwhile, the placeholder is gone and nothing happens.
-  function loadThumbnails(list) {
-    if (!config.thumbnails) return;
+  function hasSnippet(r) {
+    return !!r.snippet && !isJunkSnippet(r.snippet);
+  }
+
+  // Fills the thumbnail and preview placeholders next to each displayed
+  // result, in display order. If the view changed meanwhile, the
+  // placeholders are gone and nothing happens.
+  function loadArticleExtras(list) {
     for (const r of list) {
       if (!r.link) continue;
-      thumbnailFor(r.link).then(src => {
-        const slots = Array.from($("results").querySelectorAll(".result-thumb")).filter(s => s.dataset.for === r.link);
-        for (const slot of slots) {
+      const wantThumb = config.thumbnails;
+      const wantPreview = !hasSnippet(r);
+      if (!wantThumb && !wantPreview) continue;
+      infoFor(r.link).then(info => {
+        const slots = sel => Array.from($("results").querySelectorAll(sel)).filter(s => s.dataset.for === r.link);
+        for (const slot of slots(".result-thumb")) {
           if (slot.firstChild) continue;
-          if (!src) { slot.remove(); continue; }
+          if (!info.thumb) { slot.remove(); continue; }
           const img = document.createElement("img");
           img.alt = "";
           img.loading = "lazy";
           img.decoding = "async";
           img.addEventListener("error", () => slot.remove());
-          img.src = src;
+          img.src = info.thumb;
           slot.appendChild(img);
+        }
+        for (const slot of slots(".result-snippet.pending")) {
+          slot.classList.remove("pending");
+          if (info.preview) {
+            slot.classList.remove("none");
+            slot.innerHTML = highlight(info.preview, current ? current.highlightTerms : []);
+          } else {
+            slot.textContent = "No text preview for this result.";
+          }
         }
       });
     }
   }
 
-  function renderResults(merged, q) {
+  function renderResults(merged, highlightTerms) {
     if (!merged.length) {
       $("results").innerHTML = `<div class="empty">No results from any source. Try different words.</div>`;
       return;
     }
     $("results").innerHTML = `<ol class="results">` + merged.map(r => {
       const wc = r.wordCount ? ` · ${escapeHtml(r.wordCount)} words` : "";
+      const where = r.via === "title" ? "title match" : `#${r.rank}`;
+      const via = r.redirectedFrom ? ` · found as "${escapeHtml(r.redirectedFrom)}"` : "";
       const title = r.link
         ? `<a href="${escapeHtml(r.link)}" target="_blank" rel="noopener">${escapeHtml(r.title)}</a>`
         : escapeHtml(r.title);
-      const snippet = r.snippet && !isJunkSnippet(r.snippet)
-        ? `<div class="result-snippet">${highlight(r.snippet, q)}</div>`
-        : `<div class="result-snippet none">No text preview for this result.</div>`;
+      let snippet;
+      if (hasSnippet(r)) snippet = `<div class="result-snippet">${highlight(r.snippet, highlightTerms)}</div>`;
+      else if (r.link) snippet = `<div class="result-snippet none pending" data-for="${escapeHtml(r.link)}">Loading preview…</div>`;
+      else snippet = `<div class="result-snippet none">No text preview for this result.</div>`;
       const thumb = config.thumbnails && r.link
         ? `<div class="result-thumb" data-for="${escapeHtml(r.link)}"></div>`
         : "";
       return `<li class="result">
           <div class="result-body">
             <div class="result-title">${title}</div>
-            <div class="result-meta">${escapeHtml(r.endpoint)} #${r.rank}${wc}</div>
+            <div class="result-meta">${escapeHtml(r.endpoint)} ${where}${via}${wc}</div>
             <div class="result-match">${escapeHtml(r.explain)}</div>
             ${snippet}
           </div>
           ${thumb}
         </li>`;
     }).join("") + `</ol>`;
-    loadThumbnails(merged);
+    loadArticleExtras(merged);
   }
 
   // ---------------------------------------------------------------------
   // 7. Wiring
   // ---------------------------------------------------------------------
   let config = loadConfig();
+  let strikes = loadStrikes();
+  let catalog = { sources: [], discovered: false, error: null };
+  let catalogReady = null;  // promise, resolved once the catalog has been read
   let searchSeq = 0;
-  let current = null;       // last completed search: { question, perEndpoint, ranked, q }
+  let current = null;       // last completed search: { question, perEndpoint, ranked, highlightTerms }
   let activeSource = null;  // source name when filtered, null for all sources
+
+  function isSkipped(source) {
+    return (strikes[source.book] || 0) >= SKIP_AFTER_400S;
+  }
+
+  function activeSources() {
+    return catalog.sources.filter(s => !config.disabled.includes(s.key) && !isSkipped(s));
+  }
+
+  // A 400 counts toward skipping; any successful answer resets the count.
+  function recordOutcomes(perEndpoint) {
+    for (const e of perEndpoint) {
+      if (e.status === 400) strikes[e.book] = (strikes[e.book] || 0) + 1;
+      else if (!e.error) delete strikes[e.book];
+    }
+    saveStrikes(strikes);
+  }
+
+  function loadCatalog() {
+    $("sourcesStatus").textContent = "Reading the Kiwix catalog…";
+    catalogReady = discoverSources(effectiveServer(config)).then(result => {
+      catalog = result;
+      renderSourceList();
+    });
+    return catalogReady;
+  }
+
+  function renderSourceList() {
+    $("sourcesStatus").textContent = catalog.discovered
+      ? `${catalog.sources.length} found in the Kiwix catalog, refreshed every time this page opens. Untick a source to leave it out of your searches.`
+      : `Couldn't read the Kiwix catalog (${catalog.error}), so the built-in list is used. Untick a source to leave it out of your searches.`;
+    $("sourceList").innerHTML = catalog.sources.map(s => {
+      const skipped = isSkipped(s);
+      const checked = !skipped && !config.disabled.includes(s.key);
+      const note = (skipped ? " · no search index, skipped" : "") + (s.priority ? " · boosted for emergency searches" : "");
+      return `<label class="check${skipped ? " skipped" : ""}">
+          <input type="checkbox" data-key="${escapeHtml(s.key)}"${checked ? " checked" : ""}${skipped ? " disabled" : ""}>
+          <div>${escapeHtml(s.name)} <span><code>${escapeHtml(s.book)}</code>${note}</span></div>
+        </label>`;
+    }).join("");
+  }
 
   function fillSettingsForm() {
     $("serverInput").value = config.server;
-    $("endpointsInput").value = JSON.stringify(config.endpoints, null, 2);
     $("thumbsInput").checked = config.thumbnails;
   }
 
@@ -743,7 +1190,7 @@
       ? current.ranked.filter(r => r.endpoint === activeSource)  // every result from that source
       : current.ranked.slice(0, TOP_K);
     renderFilterLine(activeSource, list.length);
-    renderResults(list, current.q);
+    renderResults(list, current.highlightTerms);
   }
 
   function setActiveSource(name) {
@@ -757,30 +1204,54 @@
     question = question.trim();
     if (!question) return;
     const seq = ++searchSeq; // ignore results from an older search if a newer one started
-    const endpoints = config.endpoints;
-    const endpointsByName = Object.fromEntries(endpoints.map(e => [e.name, e]));
     const query = buildQuery(question);
+    const variants = queryVariants(query);
+    const emergency = isEmergency(variants);
+    // Title lookups: the query as typed, plus each synonym spelled out.
+    const titleTerms = [query, ...variants.slice(1).map(v => v.join(" "))];
 
     current = null;
     activeSource = null;
     $("searchBtn").disabled = true;
-    $("queryLine").innerHTML = `Searching ${endpoints.length} sources for <span class="query-used">"${escapeHtml(query)}"</span>…`;
+    $("queryLine").innerHTML = `Searching for <span class="query-used">"${escapeHtml(query)}"</span>…`;
     $("badges").innerHTML = "";
     $("filterLine").innerHTML = "";
     $("notice").innerHTML = "";
     $("results").innerHTML = "";
 
     try {
-      const perEndpoint = await fanOutSearch(query, endpoints, effectiveServer(config));
+      await catalogReady;
       if (seq !== searchSeq) return;
+      const endpoints = activeSources();
+      const endpointsByName = Object.fromEntries(endpoints.map(e => [e.name, e]));
+      if (!endpoints.length) {
+        $("queryLine").textContent = "";
+        $("results").innerHTML = `<div class="empty">No sources selected. Tick at least one under Settings.</div>`;
+        return;
+      }
+      $("queryLine").innerHTML = `Searching ${endpoints.length} sources for <span class="query-used">"${escapeHtml(query)}"</span>…`;
+      const server = effectiveServer(config);
+      const [perEndpoint, suggestions] = await Promise.all([
+        fanOutSearch(query, endpoints, server),
+        fanOutSuggest(titleTerms, endpoints, server)
+      ]);
+      if (seq !== searchSeq) return;
+      recordOutcomes(perEndpoint);
+      await mergeTitleHits(perEndpoint, suggestions, variants);
+      if (seq !== searchSeq) return;
+      renderSourceList(); // a source may have just been marked as having no search index
       current = {
         question,
         perEndpoint,
-        ranked: rankResults(perEndpoint, query, question, endpointsByName),
-        q: queryTerms(query)
+        ranked: rankResults(perEndpoint, variants, question, endpointsByName, emergency),
+        highlightTerms: [].concat(...variants)
       };
       activeSource = source && isUsable(perEndpoint.find(e => e.name === source)) ? source : null;
-      $("queryLine").innerHTML = `Query used: <span class="query-used">"${escapeHtml(query)}"</span>`;
+      const also = variants.length > 1
+        ? ` (also as ${variants.slice(1).map(v => `<span class="query-used">"${escapeHtml(v.join(" "))}"</span>`).join(", ")})`
+        : "";
+      $("queryLine").innerHTML = `Query used: <span class="query-used">"${escapeHtml(query)}"</span>${also}` +
+        (emergency ? " · first-aid search: medical and practical sources first" : "");
       renderNotice(perEndpoint);
       renderView();
     } finally {
@@ -814,29 +1285,36 @@
   }
   window.addEventListener("popstate", searchFromHash);
 
+  // Changing the server re-reads that server's catalog.
   $("saveSettings").addEventListener("click", () => {
-    let endpoints;
-    try {
-      endpoints = JSON.parse($("endpointsInput").value);
-      if (!Array.isArray(endpoints) || !endpoints.length) throw new Error("must be a non-empty list");
-      for (const ep of endpoints) {
-        if (!ep.name || !ep.book) throw new Error("every source needs a name and a book");
-      }
-    } catch (e) {
-      $("settingsStatus").textContent = "Not saved: " + e.message;
-      return;
-    }
-    config = { server: $("serverInput").value.trim(), endpoints, thumbnails: config.thumbnails };
+    config = { ...config, server: $("serverInput").value.trim() };
     $("settingsStatus").textContent = saveConfig(config)
       ? "Saved."
       : "Applied for this visit (this browser won't let the page store settings).";
+    loadCatalog();
   });
 
+  // Ticking/unticking a source applies to the next search and is saved right away.
+  $("sourceList").addEventListener("change", e => {
+    const box = e.target.closest("input[data-key]");
+    if (!box) return;
+    const key = box.dataset.key;
+    const disabled = config.disabled.filter(k => k !== key);
+    if (!box.checked) disabled.push(key);
+    config = { ...config, disabled };
+    saveConfig(config);
+    $("settingsStatus").textContent = "Applies to your next search.";
+  });
+
+  // Also forgets which sources were skipped for having no search index.
   $("resetSettings").addEventListener("click", () => {
     clearConfig();
-    config = { server: "", endpoints: DEFAULT_ENDPOINTS, thumbnails: true };
+    clearStrikes();
+    config = defaultConfig();
+    strikes = {};
     fillSettingsForm();
     renderView();
+    loadCatalog();
     $("settingsStatus").textContent = "Reset to defaults.";
   });
 
@@ -848,11 +1326,16 @@
   });
 
   fillSettingsForm();
+  loadCatalog();
   searchFromHash();
   if (!location.hash) $("question").focus();
 
   // Exposed for automated testing only.
-  window.PrepperSearch = { runSearch, buildQuery, rankResults, parseKiwixXml, pickThumbnail };
+  window.PrepperSearch = {
+    runSearch, buildQuery, queryVariants, isEmergency, rankResults, mergeTitleHits,
+    parseKiwixXml, pickThumbnail, articleInfo, parseCatalog,
+    ready: () => catalogReady, sources: () => catalog, results: () => current
+  };
 })();
 </script>
 </body>
