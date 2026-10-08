@@ -227,6 +227,8 @@
       Every result from every source is then scored the same way, strongest signal first: an article whose
       title is exactly your search, query words in the title, query words together as a phrase in the title,
       a source match for the kind of question ("how to" favors WikiHow), then query words in the snippet.
+      Results whose title and snippet together are missing some of your search words move down, in
+      proportion to how many are missing.
     </div>
     <div class="help">
       Two adjustments apply only when the search contains a first-aid or emergency term (CPR, tourniquet,
@@ -256,7 +258,9 @@
   const SUGGEST_COUNT = 8;
   const TOP_K = 8;
   const HTTP_TIMEOUT_MS = 12000; // per source
-  const REDIRECT_TIMEOUT_MS = 5000;
+  // Title lookups help short searches ("cpr", "lego", a band name). Longer
+  // questions already get well-titled full-text results, so they skip it.
+  const MAX_TITLE_LOOKUP_TERMS = 3;
   const STORAGE_KEY = "prepper_disk_search_config_v2";
 
   // Thumbnails and previews: found by reading the start of each displayed article.
@@ -266,12 +270,20 @@
   const PREVIEW_CHARS = 320;
 
   const EXACT_TITLE_WEIGHT = 5.0;       // title is exactly the search (or a redirect named exactly that)
+  const EXACT_TITLE_WEIGHT_HOW_TO = 1.0;  // same, for "how to ..." questions
+  const HOW_TO_QUESTION = /\b(how to|how do|how can|how should|steps to)\b/;
   const TITLE_COVERAGE_WEIGHT = 4.0;
   const TITLE_PHRASE_WEIGHT = 2.0;
   const EMERGENCY_SOURCE_WEIGHT = 2.0;  // emergency search + medical/practical source
   const INTENT_WEIGHT = 1.0;
   const SNIPPET_COVERAGE_WEIGHT = 0.5;
   const MEDIA_PENALTY = 3.0;            // emergency search + "(album)", "(film)"... title
+  // Kiwix also returns pages that match only some of the search words. A
+  // result whose title and snippet together lack some words loses this much,
+  // scaled by the share missing ("treat burn" -> "How to Treat Depression"
+  // is missing half, so loses 2). A penalty, not removal: snippets are short
+  // excerpts and can miss a word by bad luck.
+  const MISSING_WORDS_PENALTY = 4.0;
   const DISAMBIG_PENALTY = 4.0;         // always
 
   // Searches containing any of these phrases are treated as first aid /
@@ -353,6 +365,16 @@
     "that", "this", "and", "or", "if", "so", "will", "would", "should"
   ]);
   const PHRASE_STOPWORDS = new Set([...STOPWORDS, "your", "their", "his", "her", "its", "our"]);
+  // Generic verbs and filler that appear in questions ("how to USE an AED",
+  // "how to MAKE a tourniquet") but say nothing about the topic. Left in the
+  // search, they match thousands of unrelated pages ("Cannabis use disorder").
+  // Dropped from the search unless nothing else is left.
+  const WEAK_WORDS = new Set([
+    "use", "using", "used", "make", "making", "made", "get", "getting", "do", "doing", "done",
+    "perform", "performing", "apply", "applying", "give", "giving", "put", "take", "help",
+    "need", "know", "way", "ways", "best", "proper", "properly", "correctly",
+    "someone", "somebody", "person", "people", "thing", "things", "tell", "learn", "safely"
+  ]);
   const SITE_SUFFIX = /\s+[|\-–—]\s+[^|\-–—]{1,25}$/; // " | Ready.gov", " - wikiHow"
 
   // ---------------------------------------------------------------------
@@ -361,7 +383,8 @@
   function buildQuery(question) {
     const words = question.toLowerCase().match(/[a-z0-9']+/g) || [];
     const kept = words.filter(w => !STOPWORDS.has(w));
-    return (kept.length ? kept : words).join(" ");
+    const strong = kept.filter(w => !WEAK_WORDS.has(w));
+    return (strong.length ? strong : kept.length ? kept : words).join(" ");
   }
 
   // ---------------------------------------------------------------------
@@ -684,32 +707,12 @@
     }));
   }
 
-  // If an article address is a redirect, follows it and names the result
-  // after the target article. Only the headers are needed.
-  async function resolveRedirect(item) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REDIRECT_TIMEOUT_MS);
-    try {
-      const res = await fetch(item.link, { signal: controller.signal });
-      if (res.body && typeof res.body.cancel === "function") res.body.cancel().catch(() => {});
-      if (res.ok && res.redirected && res.url && linkKey(res.url) !== linkKey(item.link)) {
-        const seg = decodeURIComponent(new URL(res.url).pathname.split("/").filter(Boolean).pop() || "");
-        const target = seg.replace(/_/g, " ").replace(/\.html?$/i, "").trim();
-        item.link = res.url;
-        if (target) { item.redirectedFrom = item.title; item.title = target; }
-      }
-    } catch (e) {
-      /* keep the address as is */
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
   // Adds title hits that contain every query word to each source's results.
   // A title hit that is already among the full-text results just marks that
-  // result as an exact title match, so it keeps its snippet.
-  async function mergeTitleHits(perEndpoint, suggestions, variants) {
-    const jobs = [];
+  // result as an exact title match, so it keeps its snippet. Redirects are
+  // followed later, when the article is read for its preview (see
+  // applyRedirect), so nothing here waits on another request.
+  function mergeTitleHits(perEndpoint, suggestions, variants) {
     perEndpoint.forEach((entry, i) => {
       if (entry.error) return;
       for (const s of suggestions[i] || []) {
@@ -721,22 +724,33 @@
           if (exact && !dup.exactTitle) { dup.exactTitle = true; dup.matchedTitle = s.title; }
           continue;
         }
-        const item = { ...s, via: "title", rank: entry.items.length + 1, exactTitle: exact, matchedTitle: s.title };
-        entry.items.push(item);
-        if (!exact) continue;
-        jobs.push(resolveRedirect(item).then(() => {
-          const twin = entry.items.find(o => o !== item && !o.drop && linkKey(o.link) === linkKey(item.link));
-          if (twin) {
-            if (!twin.exactTitle) { twin.exactTitle = true; twin.matchedTitle = item.matchedTitle; }
-            item.drop = true;
-          }
-        }));
+        entry.items.push({ ...s, via: "title", rank: entry.items.length + 1, exactTitle: exact, matchedTitle: s.title });
       }
+      entry.items = dedupeByTitle(entry.items);
     });
-    await Promise.all(jobs);
-    perEndpoint.forEach(entry => {
-      entry.items = dedupeByTitle(entry.items.filter(it => !it.drop));
-    });
+  }
+
+  // A title hit turned out to be a redirect (its article was read for a
+  // preview and the server forwarded it). Rename it after the target article;
+  // if that article is already in the same source's results, keep that copy
+  // (it has a snippet) and drop this one. Returns true if anything changed.
+  function applyRedirect(perEndpoint, item, finalUrl) {
+    if (!finalUrl || item.redirectChecked) return false;
+    item.redirectChecked = true;
+    if (linkKey(finalUrl) === linkKey(item.link)) return false;
+    const entry = perEndpoint.find(e => e.items.includes(item));
+    if (!entry) return false;
+    const seg = decodeURIComponent(new URL(finalUrl).pathname.split("/").filter(Boolean).pop() || "");
+    const target = seg.replace(/_/g, " ").replace(/\.html?$/i, "").trim();
+    item.link = finalUrl;
+    if (target) { item.redirectedFrom = item.title; item.title = target; }
+    const twin = entry.items.find(o => o !== item && (linkKey(o.link) === linkKey(finalUrl) || o.title.trim().toLowerCase() === item.title.toLowerCase()));
+    if (twin) {
+      if (item.exactTitle && !twin.exactTitle) twin.exactTitle = true;
+      if (!twin.redirectedFrom) twin.redirectedFrom = item.redirectedFrom;
+      entry.items = entry.items.filter(o => o !== item);
+    }
+    return true;
   }
 
   // ---------------------------------------------------------------------
@@ -746,11 +760,14 @@
   // ---------------------------------------------------------------------
   function rankResults(perEndpoint, variants, question, endpointsByName, emergency) {
     const ql = question.toLowerCase();
+    // "How to make a tourniquet" wants instructions, not the encyclopedia
+    // article titled "Tourniquet", so an exact title counts for less.
+    const exactWeight = HOW_TO_QUESTION.test(ql) ? EXACT_TITLE_WEIGHT_HOW_TO : EXACT_TITLE_WEIGHT;
     const scored = [];
     for (const entry of perEndpoint) {
       const ep = endpointsByName[entry.name] || {};
       const intentHit = intentMatches(ep, question);
-      const prioHit = emergency && ep.priority ? 1 : 0;
+      const prioSource = emergency && ep.priority;
       entry.items.forEach((item, idx) => {
         const shownTitle = cleanTitle(item.title);
         const titleTokens = contentTerms(shownTitle);
@@ -766,24 +783,38 @@
           if (!best || s > best.s) best = { s, v, titleCov, phraseHit, snippetCov };
         }
         const exact = item.exactTitle || variants.some(v => exactTitle(v, titleTokens)) ? 1 : 0;
+        // The boost is for relevant results from trusted sources: the title must
+        // share a search word, or the snippet must contain all of them.
+        const prioHit = prioSource && (best.titleCov > 0 || best.snippetCov === 1) ? 1 : 0;
+        // Share of search words found nowhere in the title or snippet, for the
+        // best-fitting variant. Skipped when there's no usable snippet (title
+        // hits, junk WikiHow snippets): a missing snippet proves nothing.
+        let missing = 0;
+        if (hasSnippet(item)) {
+          const allTokens = titleTokens.concat(snippetTokens);
+          missing = 1 - Math.max(...variants.map(v => coverage(v, allTokens)));
+        }
         const disambig = DISAMBIG_TITLE.test(shownTitle) || DISAMBIG_SNIPPET.test(item.snippet) ? 1 : 0;
         const mediaMatch = emergency ? shownTitle.match(MEDIA_SUFFIX) : null;
         const media = mediaMatch && !new RegExp("\\b" + escapeRegExp(mediaMatch[1].toLowerCase()) + "\\b").test(ql) ? 1 : 0;
 
         const score = best.s
-          + EXACT_TITLE_WEIGHT * exact
+          + exactWeight * exact
           + INTENT_WEIGHT * intentHit
           + EMERGENCY_SOURCE_WEIGHT * prioHit
           - DISAMBIG_PENALTY * disambig
-          - MEDIA_PENALTY * media;
+          - MEDIA_PENALTY * media
+          - MISSING_WORDS_PENALTY * missing;
 
         const notes = [];
         if (exact) notes.push("exact title");
         if (prioHit) notes.push("emergency source");
         if (disambig) notes.push("disambiguation, moved down");
         if (media) notes.push(mediaMatch[1].toLowerCase() + " page, moved down");
+        if (missing > 0) notes.push(`missing ${Math.round(missing * 100)}% of search words`);
         scored.push({
           ...item,
+          src: item,  // the source's own copy, for updates after a redirect
           endpoint: entry.name,
           rank: item.rank || idx + 1,
           score,
@@ -1001,15 +1032,17 @@
     return text;
   }
 
+  // finalUrl: where the article actually is, after any redirect.
   async function fetchArticleInfo(articleUrl) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
     try {
       const res = await fetch(articleUrl, { signal: controller.signal });
-      if (!res.ok) return { thumb: null, preview: null };
-      return articleInfo(await readStart(res, THUMB_READ_LIMIT), res.url || articleUrl);
+      if (!res.ok) return { thumb: null, preview: null, finalUrl: null };
+      const finalUrl = res.url || articleUrl;
+      return { ...articleInfo(await readStart(res, THUMB_READ_LIMIT), finalUrl), finalUrl };
     } catch (e) {
-      return { thumb: null, preview: null };
+      return { thumb: null, preview: null, finalUrl: null };
     } finally {
       clearTimeout(timer);
     }
@@ -1023,7 +1056,14 @@
     while (infoActive < THUMB_CONCURRENCY && infoQueue.length) {
       const { url, resolve } = infoQueue.shift();
       infoActive++;
-      fetchArticleInfo(url).then(resolve, () => resolve({ thumb: null, preview: null })).finally(() => {
+      fetchArticleInfo(url).then(info => {
+        // The redirect target's address gets the same answer, so a result
+        // renamed after its redirect doesn't read the article again.
+        if (info.finalUrl && info.finalUrl !== url && !infoCache.has(info.finalUrl)) {
+          infoCache.set(info.finalUrl, Promise.resolve(info));
+        }
+        resolve(info);
+      }, () => resolve({ thumb: null, preview: null, finalUrl: null })).finally(() => {
         infoActive--;
         pumpInfoQueue();
       });
@@ -1054,7 +1094,13 @@
       const wantThumb = config.thumbnails;
       const wantPreview = !hasSnippet(r);
       if (!wantThumb && !wantPreview) continue;
+      const search = current;
       infoFor(r.link).then(info => {
+        if (r.via === "title" && search && search === current && r.src &&
+            applyRedirect(search.perEndpoint, r.src, info.finalUrl)) {
+          scheduleRerank(search);
+          return;  // the re-render shows this result under its new name
+        }
         const slots = sel => Array.from($("results").querySelectorAll(sel)).filter(s => s.dataset.for === r.link);
         for (const slot of slots(".result-thumb")) {
           if (slot.firstChild) continue;
@@ -1193,6 +1239,20 @@
     renderResults(list, current.highlightTerms);
   }
 
+  // Re-ranks the current search after new information (title hits, a
+  // redirect) and redraws it. Several updates arriving together cause
+  // one redraw.
+  let rerankTimer = null;
+  function scheduleRerank(search) {
+    if (rerankTimer) return;
+    rerankTimer = setTimeout(() => {
+      rerankTimer = null;
+      if (search !== current) return;  // a newer search has started
+      search.ranked = rankResults(search.perEndpoint, search.variants, search.question, search.endpointsByName, search.emergency);
+      renderView();
+    }, 0);
+  }
+
   function setActiveSource(name) {
     if (!current) return;
     activeSource = name && isUsable(current.perEndpoint.find(e => e.name === name)) ? name : null;
@@ -1208,7 +1268,10 @@
     const variants = queryVariants(query);
     const emergency = isEmergency(variants);
     // Title lookups: the query as typed, plus each synonym spelled out.
-    const titleTerms = [query, ...variants.slice(1).map(v => v.join(" "))];
+    // Short searches only.
+    const titleTerms = variants[0].length <= MAX_TITLE_LOOKUP_TERMS
+      ? [query, ...variants.slice(1).map(v => v.join(" "))]
+      : [];
 
     current = null;
     activeSource = null;
@@ -1231,29 +1294,40 @@
       }
       $("queryLine").innerHTML = `Searching ${endpoints.length} sources for <span class="query-used">"${escapeHtml(query)}"</span>…`;
       const server = effectiveServer(config);
-      const [perEndpoint, suggestions] = await Promise.all([
-        fanOutSearch(query, endpoints, server),
-        fanOutSuggest(titleTerms, endpoints, server)
-      ]);
+
+      // Step 1: full-text search only, shown as soon as it's back. Same
+      // requests as before title lookups existed, so first results are no slower.
+      const perEndpoint = await fanOutSearch(query, endpoints, server);
       if (seq !== searchSeq) return;
       recordOutcomes(perEndpoint);
-      await mergeTitleHits(perEndpoint, suggestions, variants);
-      if (seq !== searchSeq) return;
       renderSourceList(); // a source may have just been marked as having no search index
-      current = {
-        question,
-        perEndpoint,
+      const search = {
+        question, perEndpoint, variants, endpointsByName, emergency,
         ranked: rankResults(perEndpoint, variants, question, endpointsByName, emergency),
         highlightTerms: [].concat(...variants)
       };
+      current = search;
       activeSource = source && isUsable(perEndpoint.find(e => e.name === source)) ? source : null;
       const also = variants.length > 1
         ? ` (also as ${variants.slice(1).map(v => `<span class="query-used">"${escapeHtml(v.join(" "))}"</span>`).join(", ")})`
         : "";
-      $("queryLine").innerHTML = `Query used: <span class="query-used">"${escapeHtml(query)}"</span>${also}` +
+      const queryHtml = `Query used: <span class="query-used">"${escapeHtml(query)}"</span>${also}` +
         (emergency ? " · first-aid search: medical and practical sources first" : "");
+      $("queryLine").innerHTML = queryHtml + (titleTerms.length ? " · checking titles…" : "");
       renderNotice(perEndpoint);
       renderView();
+      $("searchBtn").disabled = false;
+
+      // Step 2: title lookups, started only now so they don't queue in front
+      // of the full-text searches. Matches slot into the list when they arrive.
+      if (!titleTerms.length) return;
+      const live = endpoints.filter((ep, i) => !perEndpoint[i].error);
+      const suggestions = await fanOutSuggest(titleTerms, live, server);
+      if (search !== current) return;
+      const byName = Object.fromEntries(live.map((ep, i) => [ep.name, suggestions[i]]));
+      mergeTitleHits(perEndpoint, perEndpoint.map(e => byName[e.name] || []), variants);
+      $("queryLine").innerHTML = queryHtml;
+      scheduleRerank(search);
     } finally {
       if (seq === searchSeq) $("searchBtn").disabled = false;
     }
